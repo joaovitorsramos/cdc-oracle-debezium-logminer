@@ -348,3 +348,11 @@ MigrationBackup/
 
 # Ionide (cross platform F# VS Code tools) working folder
 .ionide/
+
+#Mac Files
+.DS_Store
+
+#oracle-docker folder
+build-oracle-docker-image/
+
+

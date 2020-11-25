@@ -1,0 +1,453 @@
+ifdef::env-github[]
+:tip-caption: :bulb:
+:note-caption: :information_source:
+:important-caption: :heavy_exclamation_mark:
+:caution-caption: :fire:
+:warning-caption: :warning:
+endif::[]
+
+= Use Debezium to Monitor Oracle Database
+:toc:
+
+== About this project
+
+This project uses Debezium to capture database changes of Oracle Database 11g Release 2 Express Edition.
+
+== Important information
+
+*	Oracle 18 XE does not support LogMiner
+*	Debezium encourages the use of the LogMiner implementation for testing purposes but it does not recommend its use in production as its still under active development (source: https://debezium.io/documentation/reference/1.3/connectors/oracle.html[here]).
+
+== Getting Started - Configuring a local Oracle Database
+
+=== Install Oracle Database 11g Release 2 Express Edition on Docker 
+
+First, clone the official docker-image datase repository from oracle https://github.com/oracle/docker-images/tree/master/OracleDatabase/SingleInstance[here].
+
+Download the installation binaries of Oracle Database 11g https://www.oracle.com/database/technologies/xe-prior-releases.html#license-lightbox[here] and put them into the `docker-images/OracleDatabase/SingleInstance/dockerfiles/11.2.0.2` folder. Make sure you use the linux link: Linux x86-64. The needed file is named `oracle-xe-11.2.0-1.0.x86_64.rpm.zip`.
+
+Install Oracle instant client and sqlplus
+
+	$ brew tap InstantClientTap/instantclient
+	$ brew install instantclient-basic
+	$ brew install instantclient-sqlplus
+
+After putting the binaries files insider the `.../dockerfiles/11.2.0.2/` folder, run the script `buildDockerImage.sh` inside it, as follows to build the docker image for the Oracle Database 11g (11.2.0.2) Express Edition (XE):
+	
+	$ sh buildDockerImage.sh -x -v 11.2.0.2 -o "--memory=1g --memory-swap=2g"
+
+\... it takes around 5 minutes to finish.
+
+Run
+
+	$ docker run --name oracle_database \
+	-p 1521:1521 -p 5500:5500 \
+	-e ORACLE_PWD=adminPassword1 \
+	--shm-size="2g" \
+	-v /tmp/oracle_database_folder:/u01/app/oracle/oradata \
+	oracle/database:11.2.0.2-xe
+
+Where 	`/tmp/oracle_database_folder` is the local path in the host machine where the docker container will persist the files from the folder `/u01/app/oracle/oradata` in a volume.
+
+\... it also takes around 5 minutes to finish.
+
+
+Set Oracle_SID environment variable and permissions:
+
+	$ docker exec -u 0 -it oracle_database bash
+	$ ORACLE_SID=XE
+	$ export ORACLE_SID
+	$ cd $ORACLE_HOME/bin
+	$ chmod 6751 oracle
+
+
+== Oracle Database configuration & preparation for using Debezium
+
+The following steps need to be performed in order to prepare the database so the Debezium connector can be used. 
+
+=== Clear and drop redo log files and log groups 
+
+This step is only necessary if using Log Miner.
+
+Log in as sysdba
+
+	$ sqlplus sys/adminPassword1@//localhost:1521/XE as sysdba
+
+First you need to determine the current redo log state in the database:
+
+----
+SQL> select group#, bytes/1024/1024, status from v$log order by 1;
+
+	GROUP# BYTES/1024/1024 STATUS
+---------- --------------- ----------------
+	4	       200	INACTIVE
+	5	       200	CURRENT
+	6	       200	UNUSED
+
+SQL> select group#, member from v$logfile order by 1, 2;
+
+GROUP# MEMBER
+------ ------------------------------------------------------------
+	4 /u01/app/oracle/oradata/XE/redo04.log
+	5 /u01/app/oracle/oradata/XE/redo05.log
+	6 /u01/app/oracle/oradata/XE/redo06.log
+
+SQL> select group#, bytes/1024/1024, status from v$log order by 1;
+
+	GROUP# BYTES/1024/1024 STATUS
+---------- --------------- ----------------
+	4	       200	INACTIVE
+	5	       200	CURRENT
+	6	       200	INACTIVE
+----
+
+Clear and drop redo log files for logfile group 4. In order to add multiple log files, the group's logfile descriptor must be dropped. The default size is 200M, we will continue to use this for now.
+
+	SQL> alter database clear logfile group 4;
+	Database altered.
+
+	SQL> alter database drop logfile group 4;
+	Database altered.
+
+	SQL> alter database add logfile group 4 ('/u01/app/oracle/oradata/XE/redo04.log', '/u01/app/oracle/oradata/XE/redo04a.log') size 200M reuse;
+	Database altered.
+
+Clear and drop redo log files for logfile group 6. Just like group 4, the logfile descriptor must be dropped before multiple log files can be added. The default size is 200M, we will continue to use this for now.
+
+	SQL> alter database clear logfile group 6;
+	Database altered.
+
+	SQL> alter database drop logfile group 6;
+	Database altered.
+
+	SQL> alter database add logfile group 6 ('/u01/app/oracle/oradata/XE/redo06.log', '/u01/app/oracle/oradata/XE/redo06a.log') size 200M reuse;
+	Database altered.
+
+In order to modify logfile group 5, a log switch must be performed.
+
+	SQL> alter system switch logfile;
+	System altered.
+
+Now continue to query the database until logfile group 5 is INACTIVE. This can take a while until the database transitions from ACTIVE to INACTIVE.
+
+Once it has moved to INACTIVE, clear and drop redo log files for logfile group 5. Just like group 4, the logfile descriptor must be dropped before multiple log files can be added. The default size is 200M, we will continue to use this for now.
+
+	SQL> alter database clear logfile group 5;
+	Database altered.
+
+	SQL> alter database drop logfile group 5;
+	Database altered.
+
+	SQL> alter database add logfile group 5 ('/u01/app/oracle/oradata/XE/redo05.log', '/u01/app/oracle/oradata/XE/redo05a.log') size 200M reuse;
+	Database altered.
+
+At this point, the following should be the database state:
+
+----
+SQL> select group#, bytes/1024/1024, status from v$log order by 1;
+
+	GROUP# BYTES/1024/1024 STATUS
+---------- --------------- ----------------
+	4	       200	CURRENT
+	5	       200	UNUSED
+	6	       200	UNUSED
+
+SQL> select group#, member from v$logfile order by 1, 2;
+
+GROUP# MEMBER
+------ ------------------------------------------------------------
+	4 /u01/app/oracle/oradata/XE/redo04.log
+	4 /u01/app/oracle/oradata/XE/redo04a.log
+	5 /u01/app/oracle/oradata/XE/redo05.log
+	
+GROUP# MEMBER
+------ ------------------------------------------------------------
+	5 /u01/app/oracle/oradata/XE/redo05a.log
+	6 /u01/app/oracle/oradata/XE/redo06.log
+	6 /u01/app/oracle/oradata/XE/redo06a.log
+
+6 rows selected.
+----
+
+At this point the redo logs have 3 redo groups, but we ideally want to use 5 or 7. For testing purposes we can rely on 6 for our use case. In order to add three additional redo groups the database needs to be altered:
+
+	SQL> alter database add logfile group 1 ('/u01/app/oracle/oradata/XE/redo01.log', '/u01/app/oracle/oradata/XE/redo01a.log') size 200M reuse;
+	Database altered.
+
+	SQL> alter database add logfile group 2 ('/u01/app/oracle/oradata/XE/redo02.log', '/u01/app/oracle/oradata/XE/redo02a.log') size 200M reuse;
+	Database altered.
+
+	SQL> alter database add logfile group 3 ('/u01/app/oracle/oradata/XE/redo03.log', '/u01/app/oracle/oradata/XE/redo03a.log') size 200M reuse;
+	Database altered.
+
+At this point the Oracle redo logs queries should give you similar output to the following:
+
+----
+SQL> select group#, bytes/1024/1024, status from v$log order by 1;
+
+	GROUP# BYTES/1024/1024 STATUS
+---------- --------------- ----------------
+	1	       200	UNUSED
+	2	       200	UNUSED
+	3	       200	UNUSED
+	4	       200	CURRENT
+	5	       200	UNUSED
+	6	       200	UNUSED				
+
+SQL> select group#, member from v$logfile order by 1, 2;
+
+GROUP# MEMBER
+------ ------------------------------------------------------------
+	1 /u01/app/oracle/oradata/XE/redo01.log
+	1 /u01/app/oracle/oradata/XE/redo01a.log
+	2 /u01/app/oracle/oradata/XE/redo02.log
+	
+GROUP# MEMBER
+------ ------------------------------------------------------------
+	2 /u01/app/oracle/oradata/XE/redo02a.log
+	3 /u01/app/oracle/oradata/XE/redo03.log
+	3 /u01/app/oracle/oradata/XE/redo03a.log
+
+GROUP# MEMBER
+------ ------------------------------------------------------------
+	4 /u01/app/oracle/oradata/XE/redo04.log
+	4 /u01/app/oracle/oradata/XE/redo04a.log
+	5 /u01/app/oracle/oradata/XE/redo05.log
+
+GROUP# MEMBER
+------ ------------------------------------------------------------
+	5 /u01/app/oracle/oradata/XE/redo05a.log
+	6 /u01/app/oracle/oradata/XE/redo06.log
+	6 /u01/app/oracle/oradata/XE/redo06a.log
+		
+12 rows selected.
+----
+
+=== Create a directory to define the location of the Fast recovery Area (FRA)
+
+TIP: The db_recovery_file_dest parameter defines the location of the Flash Recovery Area (FRA) and the db_recovery_file_dest parameter specifies the default location for the recovery area. The recovery area contains multiplexed copies of the following files: Control files, Online redo logs, Archived redo logs, Flashback logs, RMAN backups. When you use the db_recovery_file_dest parameter to specify the destination of your flash recovery area, you can use a directory, file system, or ASM disk group as your destination.
+
+	docker exec -it oracle_database bash
+	mkdir /u01/app/oracle/oradata/recovery_area
+
+=== Configure Log Miner 
+
+At this point the configuration script for Log Miner can be used to setup the rest of the database.
+
+	cat setup-logminer-oracle-11ex.sh | docker exec -i oracle_database bash
+		
+When the script execution is completed the database is fully configured and prepared to send change events into Debezium.
+
+
+
+== Create Sample Data for Oracle DB - tables and records 
+
+Connect to Database
+
+	$ sqlplus sys/adminPassword1@//localhost:1521/XE as sysdba
+
+Change the database to open by executing the following command:
+
+	SQL> ALTER DATABASE OPEN;
+
+Create a new user for creating the sample database using the following CREATE USER statement:
+
+	SQL> CREATE USER OT IDENTIFIED BY Orcl1234;
+
+After that, grant privileges to the OT user by using the following GRANT statement:
+
+	SQL> GRANT CONNECT, RESOURCE, DBA TO OT;
+
+Finally, connect to the  database using the OT user account. Type the password (Orcl1234) for the OT user when SQL*plus prompts you for the password.
+
+	SQL> CONNECT ot@XE
+
+If  it doesn't work, disconnet and try:
+
+	$ sqlplus ot/Orcl1234@//localhost:1521/XE
+
+Create a sample products database:
+
+	SQL> CREATE TABLE ot.products (
+         product_id    NUMBER(5) PRIMARY KEY,
+         product_name  VARCHAR2( 255 ) NOT NULL,
+         description   VARCHAR2( 2000 ),
+         standard_cost NUMBER( 9, 2 ),
+         list_price    NUMBER( 9, 2 ));
+
+Load data into the database:
+
+	SQL>@path_to_sql_file\ot_data.sql
+
+Update a product record as an example: 
+
+	SQL> UPDATE products SET product_name = 'The best cheesecake ever' WHERE product_id = 19;
+	SQL> Commit;
+
+Query the updated record
+
+	SQL> select * from products where product_id=19;
+	
+TIP: You can use Oracle SQL Developer IDE to run commands and see files. Download it https://www.oracle.com/tools/downloads/sqldev-downloads.html[here]
+
+
+
+
+== Debezium quick start
+
+=== Starting Zookeeper
+
+ZooKeeper is the first service you must start.
+Open a terminal and use it to start ZooKeeper in a container.
+This command runs a new container using version 1.3 of the debezium/zookeeper image:
+
+	$ docker run -it --rm --name zookeeper -p 2181:2181 -p 2888:2888 -p 3888:3888 debezium/zookeeper:1.3
+
+
+=== Starting Kafka
+
+After starting ZooKeeper, you can start Kafka in a new container.
+This command runs a new container using version 1.3 of the debezium/kafka image:
+
+	$ docker run -it --rm --name kafka -p 9092:9092 --link zookeeper:zookeeper debezium/kafka:1.3
+
+
+=== Starting Kafka Connect
+
+This service exposes a REST API to manage the Debezium MySQL connector.
+
+Due to licensing requirements, the Debezium Oracle Connector does not ship with the Oracle JDBC driver and the XStream API JAR. You can obtain them for free by downloading the http://www.oracle.com/technetwork/topics/linuxx86-64soft-092277.html[Oracle Instant Client].
+Extract the archive into a directory, e.g. /tmp/instantclient/. 
+
+Open a new terminal, and use it to start the Kafka Connect service in a container:
+
+This command runs a new container using the 1.3 version of the debezium/connect image:
+
+	$ docker run -it --name connect -p 8083:8083 -e GROUP_ID=1 -e CONFIG_STORAGE_TOPIC=my_connect_configs -e OFFSET_STORAGE_TOPIC=my_connect_offsets -e STATUS_STORAGE_TOPIC=my_connect_statuses --link zookeeper:zookeeper --link kafka:kafka --link oracle_database:oracle_database -v /tmp/instantclient/:/kafka/instantclient/ debezium/connect:1.3 
+
+Run the following commands to copy the files _ojdbc8.jar and xstreams.jar from the Instant Client into Kafka’s libs directory. Create the environment variable LD_LIBRARY_PATH, pointing to the Instant Client directory:
+
+	$ cat setup-ojdbc-driver.sh | docker exec -i connect bash
+	$ docker stop connect
+	$ docker start connect
+	$ docker logs -f connect
+
+
+==== Use the Kafka Connect REST API to check the status of the Kafka Connect service
+
+Kafka Connect exposes a REST API to manage Debezium connectors. To communicate with the Kafka Connect service, you can use the curl command to send API requests to port 8083 of the Docker host (which you mapped to port 8083 in the connect container when you started Kafka Connect).
+
+Open a new terminal and check the status of the Kafka Connect service:
+
+	$ curl -H "Accept:application/json" localhost:8083/
+	{"version":"2.6.0","commit":"cb8625948210849f"}  
+
+The response shows that Kafka Connect version 2.6.0 is running.
+Check the list of connectors registered with Kafka Connect:
+
+	$ curl -H "Accept:application/json" localhost:8083/connectors/
+	[]  
+
+No connectors are currently registered with Kafka Connect.
+
+
+
+== Deploy the Oracle Connector
+
+By registering the Debezium Oracle connector, the connector will start monitoring the Oracle database server’s logs. 
+
+TIP: Typically, you would likely use the Kafka tools to manually create the necessary topics, including specifying the number of replicas. However, for this tutorial, Kafka is configured to automatically create the topics with just one replica.
+
+Open a new terminal, and use the curl command to register the Debezium Oracle connector:
+
+----
+$ curl -L -X POST 'localhost:8083/connectors/' -H 'Accept: application/json' -H 'Content-Type: application/json' --data-raw '{
+	"name": "oracle-products-connector",
+	"config": {
+		"connector.class" : "io.debezium.connector.oracle.OracleConnector",
+		"tasks.max" : "1",
+		"database.server.name" : "products",
+		"database.schema": "ot",
+		"database.hostname" : "oracle_database",
+		"database.port" : "1521",
+		"database.user" : "c##dbzuser",
+		"database.password" : "dbz",
+		"database.dbname" : "XE",
+		"database.out.server.name" : "dbzxout",
+		"database.history.kafka.bootstrap.servers" : "kafka:9092",
+		"database.history.kafka.topic": "schema-changes.products",
+		"database.connection.adapter": "logminer"		
+	}
+}'
+
+----
+
+
+Verify that oracle-products-connector is included in the list of connectors:
+
+	$ curl -i -X GET -H "Accept:application/json" localhost:8083/connectors/oracle-products-connector
+
+=== Viewing change events
+
+This command runs the watch-topic utility in a new container using the 1.3 version of the debezium/kafka image:
+	
+	$ docker run -it --rm --name watcher --link zookeeper:zookeeper --link kafka:kafka debezium/kafka:1.3 watch-topic -a -k products.OT.PRODUCTS
+
+To view all existing topics in Kafka:
+
+	$ docker run -it --rm --link zookeeper:zookeeper debezium/kafka:1.3 list-topics
+
+
+
+== Useful links (used to build this tutorial)
+
+https://github.com/oracle/docker-images/tree/master/OracleDatabase/SingleInstance
+https://debezium.io/documentation/reference/1.3/connectors/oracle.html
+https://docs.oracle.com/cd/B19306_01/backup.102/b14192/setup005.htm#BRBSC183
+https://www.oracletutorial.com/getting-started/create-oracle-sample-database-for-practice/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
